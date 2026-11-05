@@ -29,7 +29,8 @@ fn contains_prohibited_link(content: &str) -> bool {
             .and_then(|url| url.host_str().map(str::to_owned))
             .is_some_and(|host| {
                 let host = host.trim_end_matches('.');
-                host.eq_ignore_ascii_case("x.com") || host.to_ascii_lowercase().ends_with(".x.com")
+                host.eq_ignore_ascii_case("x.com") || host.to_ascii_lowercase().ends_with(".x.com") || host_lower == "twitter.com"
+        || host_lower.ends_with(".twitter.com")
             })
     })
 }
