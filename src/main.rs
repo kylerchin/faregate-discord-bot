@@ -10,6 +10,16 @@ use url::Url;
 
 const WARNING: &str = "x.com urls are prohibited on LA Metro";
 
+fn is_prohibited_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    let host_lower = host.to_ascii_lowercase();
+
+    host_lower == "x.com"
+        || host_lower.ends_with(".x.com")
+        || host_lower == "twitter.com"
+        || host_lower.ends_with(".twitter.com")
+}
+
 fn contains_prohibited_link(content: &str) -> bool {
     let mut finder = LinkFinder::new();
     // Keep email recognition enabled so user@x.com is not treated as a URL.
@@ -26,12 +36,8 @@ fn contains_prohibited_link(content: &str) -> bool {
         };
         Url::parse(&candidate)
             .ok()
-            .and_then(|url| url.host_str().map(str::to_owned))
-            .is_some_and(|host| {
-                let host = host.trim_end_matches('.');
-                host.eq_ignore_ascii_case("x.com") || host.to_ascii_lowercase().ends_with(".x.com") || host_lower == "twitter.com"
-        || host_lower.ends_with(".twitter.com")
-            })
+            .and_then(|url| url.host_str().map(is_prohibited_host))
+            .unwrap_or(false)
     })
 }
 
