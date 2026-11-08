@@ -8,7 +8,7 @@ description = "Discord bot that removes x.com links"
 chrono = "0.4.45"
 dotenvy = "0.15"
 linkify = "0.11"
-rusqlite = "0.41.1"
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 serenity = { version = "0.12.5", default-features = false, features = ["builder", "client", "gateway", "model", "rustls_backend", "cache", "http"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tracing = "0.1"
