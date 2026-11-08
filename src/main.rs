@@ -3,7 +3,6 @@ use serenity::{
     async_trait,
     builder::{CreateEmbed, CreateEmbedFooter, CreateMessage},
     model::{
-        guild::AuditLogEntry,
         id::{ChannelId, GuildId, RoleId},
         prelude::*,
     },
@@ -141,30 +140,32 @@ impl EventHandler for Handler {
         ctx: Context,
         channel_id: ChannelId,
         deleted_message_id: MessageId,
-        guild_id: Option<GuildId>,
+        _guild_id: Option<GuildId>,
     ) {
-        let cached = ctx.cache.message(channel_id, deleted_message_id);
-
-        let (author_tag, author_id, content, attachments) = match cached {
-            Some(msg) => (
-                msg.author.tag(),
-                msg.author.id.get(),
-                if msg.content.is_empty() {
-                    "*No text content*".to_string()
-                } else {
-                    msg.content.clone()
-                },
-                msg.attachments
-                    .iter()
-                    .map(|a| a.url.clone())
-                    .collect::<Vec<_>>(),
-            ),
-            None => (
-                "Unknown User".to_string(),
-                0,
-                "*Message content not in cache*".to_string(),
-                vec![],
-            ),
+        // Enclose cache reference access inside a scope block so CacheRef is dropped before any .await
+        let (author_tag, author_id, content, attachments) = {
+            let cached = ctx.cache.message(channel_id, deleted_message_id);
+            match cached {
+                Some(msg) => (
+                    msg.author.tag(),
+                    msg.author.id.get(),
+                    if msg.content.is_empty() {
+                        "*No text content*".to_string()
+                    } else {
+                        msg.content.clone()
+                    },
+                    msg.attachments
+                        .iter()
+                        .map(|a| a.url.clone())
+                        .collect::<Vec<_>>(),
+                ),
+                None => (
+                    "Unknown User".to_string(),
+                    0,
+                    "*Message content not in cache*".to_string(),
+                    vec![],
+                ),
+            }
         };
 
         let mut desc = format!("**Message deleted in <#{}>**\n\n{}", channel_id.get(), content);
@@ -304,7 +305,7 @@ impl EventHandler for Handler {
         ctx: Context,
         old_if_available: Option<Member>,
         new: Option<Member>,
-        event: GuildMemberUpdateEvent,
+        _event: GuildMemberUpdateEvent,
     ) {
         let member = match new {
             Some(m) => m,
@@ -408,7 +409,7 @@ impl EventHandler for Handler {
     async fn guild_member_removal(
         &self,
         ctx: Context,
-        guild_id: GuildId,
+        _guild_id: GuildId,
         user: User,
         _member_data: Option<Member>,
     ) {
