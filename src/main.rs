@@ -23,6 +23,32 @@ use tracing::{error, info};
 use url::Url;
 
 const LOG_CHANNEL_ID: u64 = 1488275200792461333;
+const CATENARY_AUTHOR_ID: u64 = 1443445776297758760;
+
+fn ignore_message_author(author_id: u64, is_webhook: bool) -> bool {
+    is_webhook || author_id == CATENARY_AUTHOR_ID
+}
+
+fn ignore_message_delete(channel_id: ChannelId, author_id: u64, is_webhook: bool) -> bool {
+    channel_id.get() == LOG_CHANNEL_ID || ignore_message_author(author_id, is_webhook)
+}
+
+// Discord can refresh signed attachment URLs without changing the attachments.
+fn same_attachments(before: &[String], after: &[String]) -> bool {
+    before.len() == after.len()
+        && before.iter().zip(after).all(|(a, b)| {
+            a.split('?').next() == b.split('?').next()
+        })
+}
+
+fn has_message_edit(
+    before: &StoredMessage,
+    content: Option<&str>,
+    attachments: Option<&[String]>,
+) -> bool {
+    content.is_some_and(|text| text != before.content.as_str())
+        || attachments.is_some_and(|files| !same_attachments(&before.attachments, files))
+}
 const WARNING: &str = "x.com urls are prohibited on LA Metro";
 
 fn is_prohibited_host(host: &str) -> bool {
@@ -68,6 +94,20 @@ struct StoredMessage {
     author_id: u64,
     content: String,
     attachments: Vec<String>,
+    // None denotes a legacy database record whose origin was not recorded.
+    is_webhook: Option<bool>,
+}
+
+impl StoredMessage {
+    fn from_message(message: &Message) -> Self {
+        Self {
+            author_tag: message.author.tag(),
+            author_id: message.author.id.get(),
+            content: message.content.clone(),
+            attachments: message.attachments.iter().map(|a| a.url.clone()).collect(),
+            is_webhook: Some(message.webhook_id.is_some()),
+        }
+    }
 }
 
 struct Handler {
@@ -97,10 +137,22 @@ impl Handler {
                 author_id INTEGER NOT NULL,
                 content TEXT NOT NULL,
                 attachments TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                is_webhook INTEGER
             )",
             [],
         )?;
+        // Existing installations must retain their stored messages.
+        let has_webhook_column = {
+            let mut stmt = conn.prepare("PRAGMA table_info(stored_messages)")?;
+            let names = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            names.iter().any(|name| name == "is_webhook")
+        };
+        if !has_webhook_column {
+            conn.execute("ALTER TABLE stored_messages ADD COLUMN is_webhook INTEGER", [])?;
+        }
         Ok(())
     }
 
@@ -114,8 +166,8 @@ impl Handler {
 
         if let Ok(conn) = self.db.lock() {
             if let Err(e) = conn.execute(
-                "INSERT OR REPLACE INTO stored_messages (message_id, channel_id, author_tag, author_id, content, attachments, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT OR REPLACE INTO stored_messages (message_id, channel_id, author_tag, author_id, content, attachments, created_at, is_webhook)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     msg.id.get() as i64,
                     msg.channel_id.get() as i64,
@@ -123,7 +175,8 @@ impl Handler {
                     msg.author.id.get() as i64,
                     msg.content,
                     attachments_str,
-                    chrono::Utc::now().to_rfc3339()
+                    chrono::Utc::now().to_rfc3339(),
+                    msg.webhook_id.is_some()
                 ],
             ) {
                 error!(error = %e, "Failed to insert message into SQLite DB");
@@ -131,11 +184,22 @@ impl Handler {
         }
     }
 
-    fn update_message_content_in_db(&self, message_id: MessageId, new_content: &str) {
+    fn update_message_in_db(
+        &self,
+        message_id: MessageId,
+        content: Option<&str>,
+        attachments: Option<&[String]>,
+        is_webhook: Option<bool>,
+    ) {
+        let attachments = attachments.map(|files| files.join("\n"));
         if let Ok(conn) = self.db.lock() {
             if let Err(e) = conn.execute(
-                "UPDATE stored_messages SET content = ?1 WHERE message_id = ?2",
-                params![new_content, message_id.get() as i64],
+                "UPDATE stored_messages
+                 SET content = COALESCE(?1, content),
+                     attachments = COALESCE(?2, attachments),
+                     is_webhook = COALESCE(?3, is_webhook)
+                 WHERE message_id = ?4",
+                params![content, attachments, is_webhook, message_id.get() as i64],
             ) {
                 error!(error = %e, "Failed to update message in SQLite DB");
             }
@@ -145,7 +209,7 @@ impl Handler {
     fn fetch_message_from_db(&self, message_id: MessageId) -> Option<StoredMessage> {
         if let Ok(conn) = self.db.lock() {
             let mut stmt = conn
-                .prepare("SELECT author_tag, author_id, content, attachments FROM stored_messages WHERE message_id = ?1")
+                .prepare("SELECT author_tag, author_id, content, attachments, is_webhook FROM stored_messages WHERE message_id = ?1")
                 .ok()?;
 
             let result = stmt
@@ -166,6 +230,7 @@ impl Handler {
                         author_id: author_id as u64,
                         content,
                         attachments,
+                        is_webhook: row.get(4)?,
                     })
                 })
                 .ok();
@@ -250,46 +315,45 @@ impl EventHandler for Handler {
         deleted_message_id: MessageId,
         _guild_id: Option<GuildId>,
     ) {
-        // Look up original message & attachments from disk database first
-        let db_record = self.fetch_message_from_db(deleted_message_id);
+        // A deletion in the log channel must not generate another log.
+        if ignore_message_delete(channel_id, 0, false) {
+            return;
+        }
 
-        let (author_tag, author_id, content, attachments) = if let Some(rec) = db_record {
-            (
-                rec.author_tag,
-                rec.author_id,
-                if rec.content.is_empty() {
-                    "*No text content*".to_string()
-                } else {
-                    rec.content
-                },
-                rec.attachments,
-            )
-        } else {
-            // Fallback to cache if missing from DB
-            let cached_data = {
-                let cached = ctx.cache.message(channel_id, deleted_message_id);
-                cached.map(|msg| (
-                    msg.author.tag(),
-                    msg.author.id.get(),
-                    if msg.content.is_empty() {
+        let stored = self.fetch_message_from_db(deleted_message_id);
+        let cached = {
+            ctx.cache
+                .message(channel_id, deleted_message_id)
+                .map(|msg| StoredMessage::from_message(&msg))
+        };
+
+        // Check both sources, including the cache for pre-migration database rows.
+        if stored.iter().chain(cached.iter()).any(|msg| {
+            ignore_message_delete(channel_id, msg.author_id, msg.is_webhook == Some(true))
+        }) {
+            return;
+        }
+
+        let (author_tag, author_id, content, attachments) =
+            if let Some(record) = stored.or(cached) {
+                (
+                    record.author_tag,
+                    record.author_id,
+                    if record.content.is_empty() {
                         "*No text content*".to_string()
                     } else {
-                        msg.content.clone()
+                        record.content
                     },
-                    msg.attachments
-                        .iter()
-                        .map(|a| a.url.clone())
-                        .collect::<Vec<_>>(),
-                ))
+                    record.attachments,
+                )
+            } else {
+                (
+                    "Unknown User".to_string(),
+                    0,
+                    "*Message content not found in database or cache*".to_string(),
+                    vec![],
+                )
             };
-
-            cached_data.unwrap_or_else(|| (
-                "Unknown User".to_string(),
-                0,
-                "*Message content not found in database or cache*".to_string(),
-                vec![],
-            ))
-        };
 
         let mut desc = format!("**Message deleted in <#{}>**\n\n{}", channel_id.get(), content);
         if !attachments.is_empty() {
@@ -333,57 +397,119 @@ impl EventHandler for Handler {
             }
         }
 
-        // Fetch original record from SQLite DB before updating
-        let stored_msg = self.fetch_message_from_db(event.id);
+        // Gateway MESSAGE_UPDATE is partial. In particular, Discord sends
+        // embed, pin and other metadata updates which are not text/file edits.
+        if event.content.is_none() && event.attachments.is_none() {
+            return;
+        }
 
-        let old_content = stored_msg
-            .as_ref()
-            .map(|m| m.content.clone())
-            .or_else(|| old_if_available.map(|m| m.content))
-            .unwrap_or_else(|| "*Content before edit not found*".to_string());
+        let stored = self.fetch_message_from_db(event.id);
+        let old = old_if_available.as_ref().map(StoredMessage::from_message);
+        let current = new.as_ref().map(StoredMessage::from_message);
+        let before = stored.as_ref().or(old.as_ref());
+        let updated_content = event.content.as_deref();
+        let updated_attachments = event.attachments.as_ref().map(|files| {
+            files.iter().map(|file| file.url.clone()).collect::<Vec<_>>()
+        });
 
-        let original_attachments = stored_msg
-            .map(|m| m.attachments)
-            .unwrap_or_default();
+        // Preserve the original snapshot even if it was only in Serenity's
+        // cache, and refresh stored content for later deletion logs.
+        if stored.is_none() {
+            if let Some(message) = old_if_available.as_ref() {
+                self.save_message_to_db(message);
+            } else if let Some(message) = new.as_ref() {
+                self.save_message_to_db(message);
+            }
+        }
 
-        let new_content = event
-            .content
-            .clone()
-            .unwrap_or_else(|| "*No content*".to_string());
+        let is_webhook = event
+            .webhook_id
+            .map(|id| id.is_some())
+            .or_else(|| current.as_ref().and_then(|msg| msg.is_webhook))
+            .or_else(|| old.as_ref().and_then(|msg| msg.is_webhook))
+            .or_else(|| stored.as_ref().and_then(|msg| msg.is_webhook));
 
-        // Update database with new edited text content
-        if let Some(ref updated_text) = event.content {
-            self.update_message_content_in_db(event.id, updated_text);
+        self.update_message_in_db(
+            event.id,
+            updated_content,
+            updated_attachments.as_deref(),
+            is_webhook,
+        );
+
+        let excluded = is_webhook == Some(true)
+            || event.author.as_ref().is_some_and(|author| {
+                ignore_message_author(author.id.get(), false)
+            })
+            || stored.iter().chain(old.iter()).chain(current.iter()).any(|msg| {
+                ignore_message_author(msg.author_id, msg.is_webhook == Some(true))
+            });
+        if excluded {
+            return;
+        }
+
+        // Without a previous snapshot, a repeated content field is not proof
+        // of an edit. Seed the database when possible and wait for a real diff.
+        let Some(before) = before else {
+            if new.is_none() {
+                if let Ok(message) = event.channel_id.message(&ctx.http, event.id).await {
+                    self.save_message_to_db(&message);
+                }
+            }
+            return;
+        };
+
+        if !has_message_edit(before, updated_content, updated_attachments.as_deref()) {
+            return;
+        }
+
+        // Old databases did not record webhook IDs. Resolve the origin for an
+        // actual edit when neither the update nor the cached message has it.
+        if is_webhook.is_none() {
+            let Ok(message) = event.channel_id.message(&ctx.http, event.id).await else {
+                // Do not claim an edit came from a loggable author if unknown.
+                return;
+            };
+            self.save_message_to_db(&message);
+            if ignore_message_author(message.author.id.get(), message.webhook_id.is_some()) {
+                return;
+            }
         }
 
         let author_tag = event
             .author
             .as_ref()
-            .map(|a| a.tag())
-            .unwrap_or_else(|| "Unknown User".to_string());
+            .map(|author| author.tag())
+            .unwrap_or_else(|| before.author_tag.clone());
         let author_id = event
             .author
             .as_ref()
-            .map(|a| a.id.get())
-            .unwrap_or(0);
+            .map(|author| author.id.get())
+            .unwrap_or(before.author_id);
+        let new_content = updated_content.unwrap_or(&before.content);
 
         let mut desc = format!(
             "**Before edit**\n{}\n\n**After edit**\n{}",
-            old_content, new_content
+            before.content, new_content
         );
 
-        if !original_attachments.is_empty() {
-            desc.push_str("\n\n**Attached File URLs:**\n");
-            for url in original_attachments {
-                desc.push_str(&format!("{}\n", url));
-            }
-        } else if let Some(msg) = new {
-            if !msg.attachments.is_empty() {
-                desc.push_str("\n\n**Attached File URLs:**\n");
-                for att in msg.attachments {
-                    desc.push_str(&format!("{}\n", att.url));
+        if let Some(files) = updated_attachments.as_deref().filter(|files| {
+            !same_attachments(&before.attachments, files)
+        }) {
+            let format_files = |files: &[String]| {
+                if files.is_empty() {
+                    "*None*".to_string()
+                } else {
+                    files.join("\n")
                 }
-            }
+            };
+            desc.push_str(&format!(
+                "\n\n**Attachments before**\n{}\n\n**Attachments after**\n{}",
+                format_files(&before.attachments),
+                format_files(files)
+            ));
+        } else if !before.attachments.is_empty() {
+            desc.push_str("\n\n**Attached File URLs:**\n");
+            desc.push_str(&before.attachments.join("\n"));
         }
 
         let embed = CreateEmbed::new()
@@ -607,4 +733,105 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     });
     client.start().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod logging_tests {
+    use super::*;
+
+    fn stored_message() -> StoredMessage {
+        StoredMessage {
+            author_tag: "passenger".to_string(),
+            author_id: 42,
+            content: "https://example.org/train".to_string(),
+            attachments: vec!["https://cdn.discordapp.com/attachments/1/2/photo.png?ex=old".to_string()],
+            is_webhook: Some(false),
+        }
+    }
+
+    #[test]
+    fn ignores_embed_only_updates_and_unchanged_content() {
+        let before = stored_message();
+        assert!(!has_message_edit(&before, None, None));
+        assert!(!has_message_edit(&before, Some(&before.content), None));
+        assert!(!has_message_edit(&before, Some(&before.content), Some(&before.attachments)));
+    }
+
+    #[test]
+    fn logs_actual_text_edits_including_clearing_text() {
+        let before = stored_message();
+        assert!(has_message_edit(&before, Some("updated"), None));
+        assert!(has_message_edit(&before, Some(""), None));
+    }
+
+    #[test]
+    fn logs_attachment_removal_but_not_signed_url_refresh() {
+        let before = stored_message();
+        let refreshed = vec!["https://cdn.discordapp.com/attachments/1/2/photo.png?ex=new".to_string()];
+        assert!(!has_message_edit(&before, None, Some(&refreshed)));
+        assert!(has_message_edit(&before, None, Some(&[])));
+    }
+
+    #[test]
+    fn filters_webhooks_and_catenary_but_not_other_authors() {
+        assert!(ignore_message_author(42, true));
+        assert!(ignore_message_author(CATENARY_AUTHOR_ID, false));
+        assert!(!ignore_message_author(42, false));
+        let other_channel = ChannelId::new(123);
+        assert!(ignore_message_delete(other_channel, 42, true));
+        assert!(ignore_message_delete(other_channel, CATENARY_AUTHOR_ID, false));
+        assert!(!ignore_message_delete(other_channel, 42, false));
+    }
+
+    #[test]
+    fn deletes_in_moderation_log_channel_do_not_generate_logs() {
+        assert!(ignore_message_delete(ChannelId::new(LOG_CHANNEL_ID), 42, false));
+        assert!(ignore_message_delete(ChannelId::new(LOG_CHANNEL_ID), 0, false));
+        assert!(!ignore_message_delete(ChannelId::new(123), 42, false));
+    }
+
+    #[test]
+    fn migrates_legacy_database_and_persists_webhook_metadata() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE stored_messages (
+                message_id INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL,
+                author_tag TEXT NOT NULL,
+                author_id INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                attachments TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO stored_messages VALUES (1, 123, 'legacy', 42, 'before', '', 'old');",
+        ).unwrap();
+        let handler = Handler::new(conn);
+        handler.init_db().unwrap();
+        handler.init_db().unwrap();
+        let legacy = handler.fetch_message_from_db(MessageId::new(1)).unwrap();
+        assert_eq!(legacy.content, "before");
+        assert_eq!(legacy.is_webhook, None);
+
+        let mut message = Message::default();
+        message.id = MessageId::new(2);
+        message.channel_id = ChannelId::new(123);
+        message.author.id = UserId::new(42);
+        message.webhook_id = Some(WebhookId::new(42));
+        message.content = "webhook".to_string();
+        handler.save_message_to_db(&message);
+
+        let webhook = handler.fetch_message_from_db(message.id).unwrap();
+        assert_eq!(webhook.is_webhook, Some(true));
+        assert!(ignore_message_delete(message.channel_id, webhook.author_id, webhook.is_webhook == Some(true)));
+
+        handler.update_message_in_db(message.id, Some("edited"), None, None);
+        let edited = handler.fetch_message_from_db(message.id).unwrap();
+        assert_eq!(edited.content, "edited");
+        assert_eq!(edited.is_webhook, Some(true));
+
+        handler.update_message_in_db(MessageId::new(1), None, Some(&[]), Some(false));
+        let migrated = handler.fetch_message_from_db(MessageId::new(1)).unwrap();
+        assert_eq!(migrated.content, "before");
+        assert_eq!(migrated.is_webhook, Some(false));
+    }
 }
